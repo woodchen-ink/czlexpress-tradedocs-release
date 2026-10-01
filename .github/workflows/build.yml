@@ -5,11 +5,11 @@
 #
 # 触发方式:
 #   repository_dispatch (event_type: release)
-#       私有仓库推 v* 标签时自动发来, client_payload.ref 为标签名。
-#       完整编译打包并发布 Release, latest.json 挂在最新 Release 上。
+#       由私有仓库的 Release 流程发来: 推 v* 标签时 publish=true, 编译并发布 Release,
+#       latest.json 挂在最新 Release 上; 在私有仓库手动运行时 ref / publish 取它的输入,
+#       不发布即试运行, 产物只挂在本次 Actions 里。日常不用来这个仓库操作。
 #   workflow_dispatch
-#       手动试运行: 填源码的标签或分支, 默认只编译打包、产物挂在本次 Actions 里,
-#       不发布。勾选 publish 且 ref 是 v* 标签时才发布 (补发用)。
+#       在本仓库直接手动运行, 参数同上 (备用)。
 #
 # 两种触发都只有对本仓库有写权限的人能发起; 不监听 push / pull_request,
 # fork 发来的 PR 碰不到下面的 secret。
@@ -58,12 +58,14 @@ jobs:
         id: ver
         env:
           DISPATCH_REF: ${{ github.event.client_payload.ref }}
+          DISPATCH_PUBLISH: ${{ github.event.client_payload.publish }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
           if ("${{ github.event_name }}" -eq "repository_dispatch") {
             $ref = $env:DISPATCH_REF
-            $publish = $true
+            # 旧的触发方没带 publish 字段, 视为发布 (只有推标签才会这样发)
+            $publish = $env:DISPATCH_PUBLISH -ne "false"
           } else {
             $ref = $env:INPUT_REF
             $publish = $env:INPUT_PUBLISH -eq "true"
