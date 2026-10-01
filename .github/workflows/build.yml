@@ -1,0 +1,202 @@
+# 编译与发布 CZL 单证。
+#
+# 源码在私有仓库 woodchen-ink/czlexpress-tradedocs, 编译放在这个公开仓库里跑:
+# 公开仓库的 Actions 不计分钟数, 而私有仓库的 Windows runner 按 2 倍计费。
+#
+# 触发方式:
+#   repository_dispatch (event_type: release)
+#       私有仓库推 v* 标签时自动发来, client_payload.ref 为标签名。
+#       完整编译打包并发布 Release, latest.json 挂在最新 Release 上。
+#   workflow_dispatch
+#       手动试运行: 填源码的标签或分支, 默认只编译打包、产物挂在本次 Actions 里,
+#       不发布。勾选 publish 且 ref 是 v* 标签时才发布 (补发用)。
+#
+# 两种触发都只有对本仓库有写权限的人能发起; 不监听 push / pull_request,
+# fork 发来的 PR 碰不到下面的 secret。
+#
+# 需要的 secret:
+#   SOURCE_TOKEN  对 woodchen-ink/czlexpress-tradedocs 有 Contents 只读权限的 fine-grained PAT
+# 发布用本仓库自带的 GITHUB_TOKEN, 不需要额外的写权限 token。
+
+name: Build
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "源码的标签或分支, 如 v0.4.0 或 main"
+        required: true
+        default: "main"
+      publish:
+        description: "发布为正式 Release (只对 v* 标签生效)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# 同一个 ref 不并发, 防止重复发布
+concurrency:
+  group: build-${{ github.event.client_payload.ref || inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: woodchen-ink/czlexpress-tradedocs
+  WAILS_VERSION: v2.12.0
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 解析版本号
+        id: ver
+        env:
+          DISPATCH_REF: ${{ github.event.client_payload.ref }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          if ("${{ github.event_name }}" -eq "repository_dispatch") {
+            $ref = $env:DISPATCH_REF
+            $publish = $true
+          } else {
+            $ref = $env:INPUT_REF
+            $publish = $env:INPUT_PUBLISH -eq "true"
+          }
+          if (-not $ref) { throw "缺少源码 ref" }
+
+          if ($ref -match '^v(\d+\.\d+\.\d+([-+].+)?)$') {
+            $v = $Matches[1]
+          } elseif ($publish) {
+            throw "只有 v* 标签可以发布: $ref"
+          } else {
+            # 分支试运行: 版本号只用于产物命名
+            $v = "0.0.0-dryrun"
+          }
+          "ref=$ref" >> $env:GITHUB_OUTPUT
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "publish=$($publish.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          Write-Host "ref=$ref version=$v publish=$publish"
+
+      - name: 拉取源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.ver.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          # 不把 token 留在 .git/config 里, 后续步骤用不到它
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/desktop/go.mod
+          cache-dependency-path: src/desktop/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: src/desktop/frontend/package-lock.json
+
+      - name: 安装 Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+
+      - name: 确保 NSIS 可用
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y --no-progress
+            "C:\Program Files (x86)\NSIS" >> $env:GITHUB_PATH
+          }
+
+      - name: 写入版本号到 wails.json
+        working-directory: src/desktop
+        run: |
+          # 只补版本等字段, 保留仓库里已有的 info (如 protocols: 登录回调协议靠它注册)
+          $j = Get-Content wails.json -Raw -Encoding utf8 | ConvertFrom-Json
+          if (-not $j.info) { $j | Add-Member -NotePropertyName info -NotePropertyValue ([pscustomobject]@{}) }
+          $fields = [ordered]@{
+            companyName    = "CZL Express"
+            productName    = "CZL 单证"
+            productVersion = "${{ steps.ver.outputs.version }}".Split('-')[0]
+            copyright      = "Copyright © CZL Express"
+            comments       = "CZL TradeDocs"
+          }
+          foreach ($k in $fields.Keys) {
+            $j.info | Add-Member -NotePropertyName $k -NotePropertyValue $fields[$k] -Force
+          }
+          if (-not $j.info.protocols) { throw "wails.json 缺少 info.protocols, 登录回调将无法注册" }
+          $j | ConvertTo-Json -Depth 10 | Set-Content wails.json -Encoding utf8
+
+      # 只测 internal: main 包用 go:embed 嵌入 frontend/dist, 那是构建产物,
+      # 此时还不存在, 而 main 包本身也没有测试
+      - name: 测试
+        working-directory: src/desktop
+        run: go test ./internal/...
+
+      - name: 编译并打安装包
+        working-directory: src/desktop
+        run: |
+          wails build -platform windows/amd64 -nsis -trimpath `
+            -ldflags "-s -w -X main.version=${{ steps.ver.outputs.version }}"
+
+      - name: 整理产物并生成 latest.json
+        id: pkg
+        working-directory: src/desktop/build/bin
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $src = Get-ChildItem -Filter "*-installer.exe" | Select-Object -First 1
+          if (-not $src) { throw "没有找到安装包" }
+          $name = "CZLTradeDocs-Setup-$v.exe"
+          Move-Item $src.FullName $name -Force
+
+          $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item $name).Length
+
+          $notesFile = "${{ github.workspace }}/src/docs/release-notes/$v.md"
+          $notes = if (Test-Path $notesFile) { Get-Content $notesFile -Raw -Encoding utf8 } else { "" }
+
+          $manifest = [ordered]@{
+            version   = $v
+            pubDate   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            notes     = $notes.Trim()
+            installer = [ordered]@{
+              url    = "https://github.com/${{ github.repository }}/releases/download/v$v/$name"
+              sha256 = $hash
+              size   = $size
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content latest.json -Encoding utf8
+
+          "installer=$name" >> $env:GITHUB_OUTPUT
+          "notes=$notesFile" >> $env:GITHUB_OUTPUT
+          Write-Host "安装包 $name  $size bytes  sha256=$hash"
+
+      - name: 上传产物 (试运行与正式发布都保留一份)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CZLTradeDocs-${{ steps.ver.outputs.version }}
+          path: |
+            src/desktop/build/bin/${{ steps.pkg.outputs.installer }}
+            src/desktop/build/bin/latest.json
+          retention-days: 14
+
+      - name: 发布 Release
+        if: steps.ver.outputs.publish == 'true'
+        working-directory: src/desktop/build/bin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $notesFile = "${{ steps.pkg.outputs.notes }}"
+          $ghArgs = @("release", "create", "v$v", "--repo", "${{ github.repository }}", "--title", "CZL 单证 v$v")
+          if (Test-Path $notesFile) { $ghArgs += @("--notes-file", $notesFile) } else { $ghArgs += @("--notes", "") }
+          # latest.json 必须挂在「最新」Release 上: 客户端通过
+          # releases/latest/download/latest.json 这个固定地址取清单
+          $ghArgs += @("--latest", "${{ steps.pkg.outputs.installer }}", "latest.json")
+          gh @ghArgs
