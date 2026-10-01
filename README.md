@@ -7,6 +7,6 @@ CZL Express 出品的免费 Windows 外贸单证工具：一票货录入一次�
 本仓库只用于编译和发布安装包，程序通过这里的 Release 在线更新。
 
 - 产品介绍：https://www.czl.net/cn/tradedocs
-- 下载安装包：https://drive.czl.net/@s/cir ，或本仓库 [Releases](../../releases/latest)
+- 下载安装包：https://drive.czl.net/@s/ctr ，或本仓库 [Releases](../../releases/latest)
 - 问题反馈：https://www.sunai.net/t/topic/1494
 - 邮件：support@czl.net
