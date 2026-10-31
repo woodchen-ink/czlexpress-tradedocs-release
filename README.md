@@ -7,7 +7,7 @@ CZL Express 出品的免费外贸单证工具（Windows / macOS）：一票货�
 本仓库只用于编译和发布安装包，程序通过这里的 Release 在线更新。
 
 - 产品介绍：https://www.czl.net/cn/tradedocs
-- 下载最新版：[Windows](../../releases/latest/download/CZLTradeDocs-Setup.exe) · [macOS](../../releases/latest/download/CZLTradeDocs-macos.dmg)，或本仓库 [Releases](../../releases/latest)；国内镜像 https://drive.czl.net/@s/ctr
+- 下载最新版：[Windows](../../releases/latest/download/CZLTradeDocs-Setup.exe) · [macOS](../../releases/latest/download/CZLTradeDocs-macos.dmg)，或本仓库 [Releases](../../releases/latest)；国内直连 https://connect.czl.net/dl/czlexpress-tradedocs/latest/windows 、 https://connect.czl.net/dl/czlexpress-tradedocs/latest/macos
 - 问题反馈：https://www.sunai.net/t/topic/1494
 - 邮件：support@czl.net
 
