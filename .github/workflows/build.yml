@@ -170,6 +170,8 @@ jobs:
         working-directory: src/desktop
         run: go test ./internal/...
 
+      # 产物用不带版本号的固定文件名: 官网与论坛直接链 releases/latest/download/<文件名>,
+      # 永远指向最新版; 清单里的地址带 /download/v<版本>/, 仍指向确定的版本。
       - name: 编译 Windows 安装包
         if: matrix.goos == 'windows'
         working-directory: src/desktop
@@ -179,7 +181,7 @@ jobs:
           $src = Get-ChildItem build/bin -Filter "*-installer.exe" | Select-Object -First 1
           if (-not $src) { throw "没有找到安装包" }
           New-Item -ItemType Directory -Force dist | Out-Null
-          Move-Item $src.FullName "dist/CZLTradeDocs-Setup-$env:VERSION.exe" -Force
+          Move-Item $src.FullName "dist/CZLTradeDocs-Setup.exe" -Force
 
       # macOS 产出两份: .dmg 给人下载 (拖进「应用程序」), .zip 给在线更新 (ditto 解包后原位替换)。
       # 没有 Apple 开发者证书, 只做 ad-hoc 签名: Apple 芯片要求至少有签名才能运行,
@@ -200,12 +202,12 @@ jobs:
           codesign --force --deep --sign - $app
           if ($LASTEXITCODE) { throw "codesign 失败" }
 
-          ditto -c -k --keepParent $app "dist/CZLTradeDocs-$env:VERSION-macos.zip"
+          ditto -c -k --keepParent $app "dist/CZLTradeDocs-macos.zip"
           if ($LASTEXITCODE) { throw "zip 打包失败" }
 
           # -fs HFS+: 默认 APFS 时 hdiutil 估算镜像大小有误, 报「设备上无剩余空间」
           ln -s /Applications stage/Applications
-          hdiutil create -volname "CZL 单证" -srcfolder stage -fs HFS+ -ov -format UDZO "dist/CZLTradeDocs-$env:VERSION-macos.dmg"
+          hdiutil create -volname "CZL 单证" -srcfolder stage -fs HFS+ -ov -format UDZO "dist/CZLTradeDocs-macos.dmg"
           if ($LASTEXITCODE) { throw "dmg 打包失败" }
 
       - name: 上传本平台产物
@@ -254,10 +256,10 @@ jobs:
               size   = (Get-Item $name).Length
             }
           }
-          $win = Describe "CZLTradeDocs-Setup-$v.exe"
-          $mac = Describe "CZLTradeDocs-$v-macos.zip"
+          $win = Describe "CZLTradeDocs-Setup.exe"
+          $mac = Describe "CZLTradeDocs-macos.zip"
           # dmg 只给人下载, 不进清单
-          if (-not (Test-Path "CZLTradeDocs-$v-macos.dmg")) { throw "缺少 dmg" }
+          if (-not (Test-Path "CZLTradeDocs-macos.dmg")) { throw "缺少 dmg" }
 
           $notesFile = "${{ github.workspace }}/src/docs/release-notes/$v.md"
           $notes = if (Test-Path $notesFile) { Get-Content $notesFile -Raw -Encoding utf8 } else { "" }
