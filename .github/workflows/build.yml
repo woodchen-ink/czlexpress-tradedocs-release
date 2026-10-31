@@ -1,7 +1,10 @@
-# 编译与发布 CZL 单证。
+# 编译与发布 CZL 单证 (Windows 安装包 + macOS 通用版)。
 #
 # 源码在私有仓库 woodchen-ink/czlexpress-tradedocs, 编译放在这个公开仓库里跑:
-# 公开仓库的 Actions 不计分钟数, 而私有仓库的 Windows runner 按 2 倍计费。
+# 公开仓库的 Actions 不计分钟数, 而私有仓库的 Windows / macOS runner 按倍数计费。
+#
+# 三段: meta 解析版本 → build 按平台矩阵编译打包 → publish 合成 latest.json 并发 Release。
+# 两个平台都成功才发布, 清单里不会出现只有一半平台的版本。
 #
 # 触发方式:
 #   repository_dispatch (event_type: release)
@@ -47,12 +50,15 @@ env:
   WAILS_VERSION: v2.12.0
 
 jobs:
-  build:
-    runs-on: windows-latest
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.ver.outputs.ref }}
+      version: ${{ steps.ver.outputs.version }}
+      publish: ${{ steps.ver.outputs.publish }}
     defaults:
       run:
         shell: pwsh
-
     steps:
       - name: 解析版本号
         id: ver
@@ -85,11 +91,32 @@ jobs:
           "publish=$($publish.ToString().ToLower())" >> $env:GITHUB_OUTPUT
           Write-Host "ref=$ref version=$v publish=$publish"
 
+  build:
+    needs: meta
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goos: windows
+            runner: windows-latest
+            platform: windows/amd64
+          # 通用版 (Intel + Apple 芯片) 一个包
+          - goos: darwin
+            runner: macos-latest
+            platform: darwin/universal
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+
+    steps:
       - name: 拉取源码
         uses: actions/checkout@v7
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ steps.ver.outputs.ref }}
+          ref: ${{ needs.meta.outputs.ref }}
           token: ${{ secrets.SOURCE_TOKEN }}
           path: src
           # 不把 token 留在 .git/config 里, 后续步骤用不到它
@@ -110,6 +137,7 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
 
       - name: 确保 NSIS 可用
+        if: matrix.goos == 'windows'
         run: |
           if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
             choco install nsis -y --no-progress
@@ -119,13 +147,14 @@ jobs:
       - name: 写入版本号到 wails.json
         working-directory: src/desktop
         run: |
-          # 只补版本等字段, 保留仓库里已有的 info (如 protocols: 登录回调协议靠它注册)
+          # 只补版本等字段, 保留仓库里已有的 info (如 protocols: 登录回调协议靠它注册,
+          # Windows 写进注册表, macOS 写进 Info.plist)
           $j = Get-Content wails.json -Raw -Encoding utf8 | ConvertFrom-Json
           if (-not $j.info) { $j | Add-Member -NotePropertyName info -NotePropertyValue ([pscustomobject]@{}) }
           $fields = [ordered]@{
             companyName    = "CZL Express"
             productName    = "CZL 单证"
-            productVersion = "${{ steps.ver.outputs.version }}".Split('-')[0]
+            productVersion = $env:VERSION.Split('-')[0]
             copyright      = "Copyright © CZL Express"
             comments       = "CZL TradeDocs"
           }
@@ -141,64 +170,129 @@ jobs:
         working-directory: src/desktop
         run: go test ./internal/...
 
-      - name: 编译并打安装包
+      - name: 编译 Windows 安装包
+        if: matrix.goos == 'windows'
         working-directory: src/desktop
         run: |
-          wails build -platform windows/amd64 -nsis -trimpath `
-            -ldflags "-s -w -X main.version=${{ steps.ver.outputs.version }}"
-
-      - name: 整理产物并生成 latest.json
-        id: pkg
-        working-directory: src/desktop/build/bin
-        run: |
-          $v = "${{ steps.ver.outputs.version }}"
-          $src = Get-ChildItem -Filter "*-installer.exe" | Select-Object -First 1
+          wails build -platform ${{ matrix.platform }} -nsis -trimpath `
+            -ldflags "-s -w -X main.version=$env:VERSION"
+          $src = Get-ChildItem build/bin -Filter "*-installer.exe" | Select-Object -First 1
           if (-not $src) { throw "没有找到安装包" }
-          $name = "CZLTradeDocs-Setup-$v.exe"
-          Move-Item $src.FullName $name -Force
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Move-Item $src.FullName "dist/CZLTradeDocs-Setup-$env:VERSION.exe" -Force
 
-          $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
-          $size = (Get-Item $name).Length
+      # macOS 产出两份: .dmg 给人下载 (拖进「应用程序」), .zip 给在线更新 (ditto 解包后原位替换)。
+      # 没有 Apple 开发者证书, 只做 ad-hoc 签名: Apple 芯片要求至少有签名才能运行,
+      # 首次打开需在「系统设置 → 隐私与安全性」点「仍要打开」; 在线更新下载的包不带隔离标记, 不再询问。
+      - name: 编译 macOS 应用
+        if: matrix.goos == 'darwin'
+        working-directory: src/desktop
+        run: |
+          wails build -platform ${{ matrix.platform }} -trimpath `
+            -ldflags "-s -w -X main.version=$env:VERSION"
+          $src = Get-ChildItem build/bin -Filter "*.app" -Directory | Select-Object -First 1
+          if (-not $src) { throw "没有找到 .app" }
+
+          # Finder 里显示的是包名, 换成中文产品名; 包内可执行文件名不变
+          New-Item -ItemType Directory -Force stage, dist | Out-Null
+          $app = "stage/CZL 单证.app"
+          Move-Item $src.FullName $app
+          codesign --force --deep --sign - $app
+          if ($LASTEXITCODE) { throw "codesign 失败" }
+
+          ditto -c -k --keepParent $app "dist/CZLTradeDocs-$env:VERSION-macos.zip"
+          if ($LASTEXITCODE) { throw "zip 打包失败" }
+
+          # -fs HFS+: 默认 APFS 时 hdiutil 估算镜像大小有误, 报「设备上无剩余空间」
+          ln -s /Applications stage/Applications
+          hdiutil create -volname "CZL 单证" -srcfolder stage -fs HFS+ -ov -format UDZO "dist/CZLTradeDocs-$env:VERSION-macos.dmg"
+          if ($LASTEXITCODE) { throw "dmg 打包失败" }
+
+      - name: 上传本平台产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-${{ matrix.goos }}
+          path: src/desktop/dist/*
+          retention-days: 14
+
+  publish:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - name: 拉取发布说明
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.meta.outputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+          sparse-checkout: docs/release-notes
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-*
+          path: dist
+          merge-multiple: true
+
+      - name: 生成 latest.json
+        id: pkg
+        working-directory: dist
+        run: |
+          $v = $env:VERSION
+          $base = "https://github.com/${{ github.repository }}/releases/download/v$v"
+          function Describe($name) {
+            if (-not (Test-Path $name)) { throw "缺少产物 $name" }
+            [ordered]@{
+              url    = "$base/$name"
+              sha256 = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+              size   = (Get-Item $name).Length
+            }
+          }
+          $win = Describe "CZLTradeDocs-Setup-$v.exe"
+          $mac = Describe "CZLTradeDocs-$v-macos.zip"
+          # dmg 只给人下载, 不进清单
+          if (-not (Test-Path "CZLTradeDocs-$v-macos.dmg")) { throw "缺少 dmg" }
 
           $notesFile = "${{ github.workspace }}/src/docs/release-notes/$v.md"
           $notes = if (Test-Path $notesFile) { Get-Content $notesFile -Raw -Encoding utf8 } else { "" }
 
+          # installer 是 Windows 包: 只认这个字段的旧版客户端靠它继续升级, 不能删
           $manifest = [ordered]@{
-            version   = $v
-            pubDate   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            notes     = $notes.Trim()
-            installer = [ordered]@{
-              url    = "https://github.com/${{ github.repository }}/releases/download/v$v/$name"
-              sha256 = $hash
-              size   = $size
-            }
+            version    = $v
+            pubDate    = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            notes      = $notes.Trim()
+            installer  = $win
+            installers = [ordered]@{ windows = $win; darwin = $mac }
           }
           $manifest | ConvertTo-Json -Depth 5 | Set-Content latest.json -Encoding utf8
-
-          "installer=$name" >> $env:GITHUB_OUTPUT
           "notes=$notesFile" >> $env:GITHUB_OUTPUT
-          Write-Host "安装包 $name  $size bytes  sha256=$hash"
+          Get-ChildItem | ForEach-Object { Write-Host "$($_.Name)  $($_.Length) bytes" }
 
-      - name: 上传产物 (试运行与正式发布都保留一份)
+      - name: 上传合并产物 (试运行与正式发布都保留一份)
         uses: actions/upload-artifact@v7
         with:
-          name: CZLTradeDocs-${{ steps.ver.outputs.version }}
-          path: |
-            src/desktop/build/bin/${{ steps.pkg.outputs.installer }}
-            src/desktop/build/bin/latest.json
+          name: CZLTradeDocs-${{ env.VERSION }}
+          path: dist/*
           retention-days: 14
 
       - name: 发布 Release
-        if: steps.ver.outputs.publish == 'true'
-        working-directory: src/desktop/build/bin
+        if: needs.meta.outputs.publish == 'true'
+        working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $v = "${{ steps.ver.outputs.version }}"
+          $v = $env:VERSION
           $notesFile = "${{ steps.pkg.outputs.notes }}"
           $ghArgs = @("release", "create", "v$v", "--repo", "${{ github.repository }}", "--title", "CZL 单证 v$v")
           if (Test-Path $notesFile) { $ghArgs += @("--notes-file", $notesFile) } else { $ghArgs += @("--notes", "") }
           # latest.json 必须挂在「最新」Release 上: 客户端通过
           # releases/latest/download/latest.json 这个固定地址取清单
-          $ghArgs += @("--latest", "${{ steps.pkg.outputs.installer }}", "latest.json")
+          $ghArgs += "--latest"
+          $ghArgs += Get-ChildItem -File | ForEach-Object { $_.Name }
           gh @ghArgs
