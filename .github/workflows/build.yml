@@ -47,7 +47,7 @@ concurrency:
 
 env:
   SOURCE_REPO: woodchen-ink/czlexpress-tradedocs
-  WAILS_VERSION: v2.12.0
+  WAILS_VERSION: v2.17.1
 
 jobs:
   meta:
